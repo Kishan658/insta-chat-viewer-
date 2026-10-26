@@ -279,7 +279,7 @@ const RE_ATT=/sent an attachment\.?$/i;
 const RE_REACT=/^(liked a message|reacted .+ to your message|.+ reacted .+)$/i;
 const RE_SYS=/(audio call|video chat|video call|changed the theme|changed the emoji|set the nickname|set nicknames|named the group|changed the group|to the group|left the group|missed a call|missed a video)/i;
 // kinds: 0 text, 1 shared post/reel, 2 attachment without data, 3 system line, 4 like/reaction event
-function parseDoc(doc,names,seq){
+function parseDoc(doc,names){
   const out=[];
   const ents=doc.querySelectorAll('div.uiBoxWhite._a6-g');
   for(const e of ents){
@@ -319,13 +319,22 @@ function parseDoc(doc,names,seq){
     else if(text.length<90&&RE_SYS.test(text)) kind=3;
     else kind=0;
     if(cap.length>400) cap=cap.slice(0,400)+'…';
-    out.push([si,t,kind,text,cap,user,link,rx.length?rx:0,seq++]);
+    out.push([si,t,kind,text,cap,user,link,rx.length?rx:0,0]);
   }
-  return {out,seq};
+  return out;
 }
-function orderMsgs(all){
+// Puts every message in date order. It never looks at file names or the order the files were picked:
+// each file is turned newest-first, files are ranked by their newest message, and ties inside the
+// same minute keep the order Instagram wrote them in.
+function mergeParts(parts){
+  const ps=parts.filter(p=>p.length);
+  for(const p of ps){ if(p.length>1&&p[0][1]<p[p.length-1][1]) p.reverse(); }
+  const mx=p=>{let m=-Infinity;for(const e of p) if(e[1]>m) m=e[1];return m;};
+  ps.sort((a,b)=>mx(b)-mx(a));
+  const all=[];let seq=0;
+  for(const p of ps) for(const e of p){ e[8]=seq++; all.push(e); }
   all.sort((a,b)=>a[1]-b[1]||b[8]-a[8]);
-  for(const m of all) m.pop();
+  for(const e of all) e.pop();
   return all;
 }
 //</parse>
@@ -391,29 +400,32 @@ $('files').addEventListener('change',()=>{const f=$('files').files;if(f&&f.lengt
 
 async function importFiles(fl){
   $('err').hidden=true;$('pick').disabled=true;
-  const files=[...fl].sort((a,b)=>{const n=s=>{const m=s.match(/(\d+)(?!.*\d)/);return m?+m[1]:0;};return n(a.name)-n(b.name);});
-  const names=[],all=[];let seq=0;
+  // The same file picked twice is read once. The order of the files does not matter.
+  const seen=new Set(),files=[];
+  for(const f of fl){const key=f.name+'|'+f.size;if(!seen.has(key)){seen.add(key);files.push(f);}}
+  const names=[],parts=[];
   try{
     for(let k=0;k<files.length;k++){
       setProg('Reading file '+(k+1)+' of '+files.length+'…',k/files.length);
       await tick();
       const html=await files[k].text();
       let doc=new DOMParser().parseFromString(html,'text/html');
-      const r=parseDoc(doc,names,seq);seq=r.seq;
-      for(const m of r.out) all.push(m);
+      parts.push(parseDoc(doc,names));
       doc=null;
     }
-    if(!all.length){fail('No messages found. Pick the message_1.html, message_2.html … files from the Instagram export.');return;}
-    setProg('Sorting '+all.length.toLocaleString()+' messages…',.97);
+    const total=parts.reduce((n,p)=>n+p.length,0);
+    if(!total){fail('No messages found. Pick the message_1.html, message_2.html … files from the Instagram export.');return;}
+    setProg('Sorting '+total.toLocaleString()+' messages by date…',.97);
     await tick();
-    D={names,msgs:orderMsgs(all)};
+    D={names,msgs:mergeParts(parts)};
     setProg('Saving a copy in this app…',.99);
     await tick();
     const id=[...names].sort().join('|');
     const old=INDEX.find(m=>m.id===id);
     CUR=old||{id:id,me:-1};
     await idbSet('chat:'+id,JSON.stringify(D));
-    if(typeof CUR.me==='number'&&CUR.me>=0&&CUR.me<D.names.length){ME=CUR.me;init();}
+    const me=resolveMe(CUR);
+    if(me>=0){ME=me;init();}
     else pickWho(true);
   }catch(e){
     fail('Could not read those files. '+(e&&e.message?e.message:''));
@@ -427,8 +439,15 @@ async function openChat(meta){
   if(!s){toast('That chat is no longer saved.');INDEX=INDEX.filter(m=>m.id!==meta.id);await idbSet('index',JSON.stringify(INDEX));showInbox();return;}
   try{D=JSON.parse(s);}catch(e){toast('Could not open that chat.');showInbox();return;}
   CUR=meta;
-  if(typeof meta.me==='number'&&meta.me>=0&&meta.me<D.names.length){ME=meta.me;init();}
+  const me=resolveMe(meta);
+  if(me>=0){ME=me;init();}
   else pickWho(true);
+}
+// "Who I am" is remembered by name, so it stays right even if the people are listed in a different order.
+function resolveMe(meta){
+  if(meta.meName){const i=D.names.indexOf(meta.meName);if(i>=0) return i;}
+  if(!meta.meName&&typeof meta.me==='number'&&meta.me>=0&&meta.me<D.names.length) return meta.me;
+  return -1;
 }
 
 /* ---------- panels ---------- */
@@ -489,7 +508,7 @@ async function saveMeta(){
   CUR.count=D.msgs.length;
   CUR.first=D.msgs[0][1];CUR.last=D.msgs[D.msgs.length-1][1];
   CUR.preview=previewText();
-  CUR.me=ME;
+  CUR.me=ME;CUR.meName=D.names[ME];
   const i=INDEX.findIndex(m=>m.id===CUR.id);
   if(i<0) INDEX.push(CUR); else INDEX[i]=CUR;
   await idbSet('index',JSON.stringify(INDEX));
